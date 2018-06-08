@@ -1,0 +1,497 @@
+rm(list=ls())
+library(rstan)
+library(boot)
+
+#===========
+# load data
+#===========
+load('c:/A. Pintail/data/ready/band.RData')
+juv <- band[,,'jf']
+juv_adult <- band[,,'jf'] + band[,,'af']
+areas <- rownames(juv)
+narea <- length(areas)
+years <- colnames(juv)
+nyear <- length(years)
+
+load('c:/A. Pintail/data/ready/marr.RData')
+marr_af <- marr_am <- marr_jf <- marr_jm <- array(, dim=c(narea, nyear, nyear+1))
+for (i in 1:narea) {
+  marr_af[i,,] <- marr[,,i,'af']
+  marr_am[i,,] <- marr[,,i,'am']
+  marr_jf[i,,] <- marr[,,i,'jf']
+  marr_jm[i,,] <- marr[,,i,'jm']
+}
+
+load('c:/A. Pintail/data/ready/bpop.RData')
+bpop_obs <- bpop$bpop
+bpop_obs_se <- bpop$bpop_se
+
+load('c:/A. Pintail/data/ready/covar.RData')
+pond <- as.matrix(covar$pond[,-1])
+pond <- log(pond)
+pond.mean <- apply(pond, 1, mean)
+pond.sd <- apply(pond, 1, sd)
+for (i in 1:narea) {
+  for (t in 1:nyear) {
+    pond[i,t] <- (pond[i,t] - pond.mean[i]) / pond.sd[i]
+  }
+}
+
+fall <- as.matrix(covar$fall[,-1])
+fall.mean <- apply(fall, 1, mean)
+fall.sd <- apply(fall, 1, sd)
+for (i in 1:narea) {
+  for (t in 1:nyear) {
+    fall[i,t] <- (fall[i,t] - fall.mean[i]) / fall.sd[i]
+  }
+}
+
+crop <- as.matrix(covar$crop[,-1])
+crop.mean <- apply(crop, 1, mean)
+crop.sd <- apply(crop, 1, sd)
+for (i in 1:narea) {
+  for (t in 1:nyear) {
+    crop[i,t] <- (crop[i,t] - crop.mean[i]) / crop.sd[i]
+  }
+}
+
+#cor(as.vector(bpop_obs), as.vector(pond))
+#cor(as.vector(bpop_obs), as.vector(fall))
+#cor(as.vector(bpop_obs), as.vector(crop))
+#cor(as.vector(pond), as.vector(fall))
+#cor(as.vector(pond), as.vector(crop))
+#cor(as.vector(fall), as.vector(crop))
+
+#cor(rowMeans(bpop_obs), rowMeans(pond))
+#cor(rowMeans(bpop_obs), rowMeans(fall))
+#cor(rowMeans(bpop_obs), rowMeans(nata))
+#cor(rowMeans(pond), rowMeans(fall))
+#cor(rowMeans(pond), rowMeans(nata))
+#cor(rowMeans(fall), rowMeans(nata))
+
+#======================
+# define model in stan
+#======================
+sink('c:/A. Pintail/ipm ddp cov.stan')
+cat("
+
+functions {
+  real getprod(vector X, int beg, int end) {
+    real p;     
+    p = 1;
+    for (j in beg:end) p = p * X[j];
+    return p;
+  }
+
+  real getsum(vector X, int beg, int end) {
+    real p;     
+    p = 0;
+    for (j in beg:end) p = p + X[j];
+    return p;
+  }
+} // functions
+
+data {
+  // basic
+  int narea; // number of areas
+  int nyear; // number of years
+
+  // covariates
+  matrix[narea, nyear] pond; // standardized pond count for each area and year
+  matrix[narea, nyear] fall; // standardized summerfallow for each area and year
+
+  // bpop
+  matrix<lower=0>[narea, nyear] bpop_obs; // estimated breeding population size
+  matrix<lower=0>[narea, nyear] bpop_obs_se; // standard error of estimated breeding population size
+
+  // reproduction
+  int<lower=0> juv[narea, nyear]; // number of banded juvenile females
+  int<lower=0> juv_adult[narea, nyear]; // number of banded juvenile and adult females
+
+  // survival
+  int<lower=0> marr_af[narea, nyear, nyear+1]; // band-recovery data of adult females
+  int<lower=0> marr_am[narea, nyear, nyear+1]; // band-recovery data of adult males
+  int<lower=0> marr_jf[narea, nyear, nyear+1]; // band-recovery data of juvenile females
+  int<lower=0> marr_jm[narea, nyear, nyear+1]; // band-recovery data of juvenile males
+} // data
+
+parameters {
+  // reproduction
+  vector[narea] log_age_ratio_mu; // mean of log female age ratio for each area
+  vector[narea] log_age_ratio_bpop; // density dependence of reproduction for each area
+  vector[narea] log_age_ratio_pond; // pond effect on reproduction for each area
+  vector[narea] log_age_ratio_fall; // summerfallow effect on reproduction for each area
+  real<lower=0> log_age_ratio_sigma; // standard deviation of log female age ratio
+  matrix[narea, nyear] log_age_ratio; // log female age ratio for each area and year
+
+  // survival
+  vector[narea] logit_sur_mu_af; // mean of logit survival of adult females for each area
+  vector[narea] logit_sur_mu_am; // mean of logit survival of adult males for each area
+  vector[narea] logit_sur_bpop_af; // density dependence of survival of adult females for each area
+  vector[narea] logit_sur_bpop_am; // density dependence of survival of adult males for each area
+  vector[narea] logit_sur_pond_af; // pond effect on survival of adult females for each area
+  vector[narea] logit_sur_pond_am; // pond effect on survival of adult males for each area
+  vector[narea] logit_sur_fall_af; // summerfallow effect on survival of adult females for each area
+  vector[narea] logit_sur_fall_am; // summerfallow effect on survival of adult males for each area
+  real<lower=0> logit_sur_sigma_af; // standard deviation of logit survival of adult females
+  real<lower=0> logit_sur_sigma_am; // standard deviation of logit survival of adult males
+  vector[nyear] logit_sur_af[narea]; // logit adult female annural survival for each area and year
+  vector[nyear] logit_sur_am[narea]; // logit adult male annural survival for each area and year
+  real logit_rec_mu_af; // mean of logit recovery rate for adult females
+  real logit_rec_mu_am; // mean of logit recovery rate for adult males
+  real logit_rec_mu_jf; // mean of logit recovery rate for juvenile females
+  real logit_rec_mu_jm; // mean of logit recovery rate for juvenile males
+  real<lower=0> logit_rec_sigma_af; // standard deviation of logit recovery rate for adult females
+  real<lower=0> logit_rec_sigma_am; // standard deviation of logit recovery rate for adult males
+  real<lower=0> logit_rec_sigma_jf; // standard deviation of logit recovery rate for juvenile females
+  real<lower=0> logit_rec_sigma_jm; // standard deviation of logit recovery rate for juvenile males
+  vector[nyear] logit_rec_af; // year specific logit recovery rate for adult females
+  vector[nyear] logit_rec_am; // year specific logit recovery rate for adult males
+  vector[nyear] logit_rec_jf; // year specific logit recovery rate for juvenile females
+  vector[nyear] logit_rec_jm; // year specific logit recovery rate for juvenile males
+
+  // bpop
+  real<lower=0> log_bpop_sigma; // standard deviation of process error in breeding population size
+  matrix[narea, nyear] log_bpop; // log breeding population size for each area and year
+} // parameters
+
+transformed parameters {
+  // reproduction
+  matrix[narea, nyear] log_age_ratio_pred; // predicted log age ratio for each area and year
+  matrix<lower=0>[narea, nyear] age_ratio; // female age ratio for each area and year
+  matrix<lower=0,upper=1>[narea, nyear] q; // a parameter calculated from age ratio
+
+  // survival
+  vector[nyear] logit_sur_pred_af[narea]; // predicted logit survival of adult females
+  vector[nyear] logit_sur_pred_am[narea]; // predicted logit survival of adult males
+  vector<lower=0,upper=1>[nyear] sur_af[narea]; // annual survival for each area and year of adult females
+  vector<lower=0,upper=1>[nyear] sur_am[narea]; // annual survival for each area and year of adult males
+  vector<lower=0,upper=1>[nyear] sur_jf[narea]; // annual survival for each area and year of juvenile females
+  vector<lower=0,upper=1>[nyear] sur_jm[narea]; // annual survival for each area and year of juvenile males
+  vector<lower=0,upper=1>[nyear] rec_af; // year specific recovery rate for adult females
+  vector<lower=0,upper=1>[nyear] rec_am; // year specific recovery rate for adult males
+  vector<lower=0,upper=1>[nyear] rec_jf; // year specific recovery rate for juvenile females
+  vector<lower=0,upper=1>[nyear] rec_jm; // year specific recovery rate for juvenile males
+  simplex[nyear+1] pr_af[narea, nyear]; // cell probability of band-recovery array for adult females
+  simplex[nyear+1] pr_am[narea, nyear]; // cell probability of band-recovery array for adult males
+  simplex[nyear+1] pr_jf[narea, nyear]; // cell probability of band-recovery array for juvenile females
+  simplex[nyear+1] pr_jm[narea, nyear]; // cell probability of band-recovery array for juvenile males
+
+  // bpop
+  real<lower=0, upper=1> m; // proportion of males in population
+  real<lower=0> phi; // ratio of female to male summer survival
+  matrix[narea, nyear-1] log_bpop_mu; // predicted log breeding population size for each area and year
+  matrix<lower=0>[narea, nyear] bpop; // breeding population size for each area and year
+
+  // reproduction
+  for (i in 1:narea) {
+    for (t in 1:nyear) {
+      log_age_ratio_pred[i,t] = 
+        log_age_ratio_mu[i] + 
+        log_age_ratio_bpop[i] * (log_bpop[i,t] - mean(row(log_bpop,i))) / sd(row(log_bpop,i)) + 
+        log_age_ratio_pond[i] * pond[i,t] + 
+        log_age_ratio_fall[i] * fall[i,t]; 
+      age_ratio[i,t] = exp(log_age_ratio[i,t]);
+      q[i,t] = age_ratio[i,t] / (1 + age_ratio[i,t]);
+    } // t
+  } // i
+
+  // survival
+  for (i in 1:narea) {
+    for (t in 1:nyear) {
+      logit_sur_pred_af[i,t] = 
+       logit_sur_mu_af[i] + 
+       logit_sur_bpop_af[i] * (log_bpop[i,t] - mean(row(log_bpop,i))) / sd(row(log_bpop,i)) + 
+       logit_sur_pond_af[i] * pond[i,t] + 
+       logit_sur_fall_af[i] * fall[i,t]; 
+      logit_sur_pred_am[i,t] = 
+       logit_sur_mu_am[i] + 
+       logit_sur_bpop_am[i] * (log_bpop[i,t] - mean(row(log_bpop,i))) / sd(row(log_bpop,i)) + 
+       logit_sur_pond_am[i] * pond[i,t] + 
+       logit_sur_fall_am[i] * fall[i,t]; 
+      sur_af[i,t] = inv_logit(logit_sur_af[i,t]);
+      sur_am[i,t] = inv_logit(logit_sur_am[i,t]);
+      sur_jf[i,t] = sur_af[i,t];
+      sur_jm[i,t] = sur_am[i,t];
+    } // t
+  } // i
+
+  for (t in 1:nyear) {
+    rec_af[t] = inv_logit(logit_rec_af[t]);
+    rec_am[t] = inv_logit(logit_rec_am[t]);
+    rec_jf[t] = inv_logit(logit_rec_jf[t]);
+    rec_jm[t] = inv_logit(logit_rec_jm[t]);
+  } // t
+
+  for (i in 1:narea) {
+    // adult
+    for (t in 1:nyear) {
+      pr_af[i,t,t] = rec_af[t];
+      pr_am[i,t,t] = rec_am[t];
+
+      for (j in (t+1):nyear) {
+        pr_af[i,t,j] = getprod(sur_af[i],t,j-1) * rec_af[t];
+        pr_am[i,t,j] = getprod(sur_am[i],t,j-1) * rec_am[t];
+      } // j
+
+      for (j in 1:(t-1)) {
+        pr_af[i,t,j] = 0;
+        pr_am[i,t,j] = 0;
+      } // j
+    } // t
+
+    for (t in 1:nyear) {
+      pr_af[i,t,nyear+1] = 1 - getsum(pr_af[i,t],t,nyear);
+      pr_am[i,t,nyear+1] = 1 - getsum(pr_am[i,t],t,nyear);
+    } // t
+
+    // juvenile
+    for (t in 1:nyear) {
+      pr_jf[i,t,t] = rec_jf[t];
+      pr_jm[i,t,t] = rec_jm[t];
+
+      for (j in (t+2):nyear) {
+        pr_jf[i,t,j] = sur_jf[i,t] * getprod(sur_af[i],t+1,j-1) * rec_af[t];
+        pr_jm[i,t,j] = sur_jm[i,t] * getprod(sur_am[i],t+1,j-1) * rec_am[t];
+      } // j
+
+      for (j in 1:(t-1)) {
+        pr_jf[i,t,j] = 0;
+        pr_jm[i,t,j] = 0;
+      } // j
+    } // t
+
+    for (t in 1:(nyear-1)) {
+      pr_jf[i,t,t+1] = sur_jf[i,t] * rec_af[t];
+      pr_jm[i,t,t+1] = sur_jm[i,t] * rec_am[t];
+    } // t
+
+    for (t in 1:nyear) {
+      pr_jf[i,t,nyear+1] = 1-getsum(pr_jf[i,t],t,nyear);
+      pr_jm[i,t,nyear+1] = 1-getsum(pr_jm[i,t],t,nyear);
+    } // t
+  } // i
+
+  // bpop
+  m = .5; 
+  phi = 1; 
+  for (i in 1:narea) {
+    for (t in 1:(nyear-1)) {
+      log_bpop_mu[i,t] = log_bpop[i,t] + 
+                          log(m * sur_am[i,t] + 
+                              (1 - m) * (sur_af[i,t] + age_ratio[i,t] * (sur_jf[i,t] + sur_jm[i,t] * phi))
+                             );
+    } // t
+
+    for (t in 1:nyear) {
+      bpop[i,t] = exp(log_bpop[i,t]);
+    } // t
+  } // i
+} // transformed parameters
+
+model {
+  ////// priors & process
+  // reproduction
+  for (i in 1:narea) {
+    log_age_ratio_mu[i] ~ normal(0, 100); 
+    log_age_ratio_bpop[i] ~ normal(0, 100); 
+    log_age_ratio_pond[i] ~ normal(0, 100); 
+    log_age_ratio_fall[i] ~ normal(0, 100); 
+  } // i
+  log_age_ratio_sigma ~ cauchy(0, 5);
+  for (i in 1:narea) {
+    for (t in 1:nyear) {
+      log_age_ratio[i,t] ~ normal(log_age_ratio_pred[i,t], log_age_ratio_sigma);
+    } // t
+  } // i
+
+  // survival
+  for (i in 1:narea) {
+    logit_sur_mu_af[i] ~ normal(0, 100);
+    logit_sur_mu_am[i] ~ normal(0, 100);
+    logit_sur_bpop_af[i] ~ normal(0, 100); 
+    logit_sur_bpop_am[i] ~ normal(0, 100); 
+    logit_sur_pond_af[i] ~ normal(0, 100); 
+    logit_sur_pond_am[i] ~ normal(0, 100); 
+    logit_sur_fall_af[i] ~ normal(0, 100); 
+    logit_sur_fall_am[i] ~ normal(0, 100); 
+  } // i
+  logit_sur_sigma_af ~ cauchy(0, 5);
+  logit_sur_sigma_am ~ cauchy(0, 5);
+  for (i in 1:narea) {
+    for (t in 1:nyear) {
+      logit_sur_af[i,t] ~ normal(logit_sur_pred_af[i,t], logit_sur_sigma_af);
+      logit_sur_am[i,t] ~ normal(logit_sur_pred_am[i,t], logit_sur_sigma_am);
+    } // t
+  } // i
+
+  logit_rec_mu_af ~ normal(0, 100); 
+  logit_rec_mu_am ~ normal(0, 100); 
+  logit_rec_mu_jf ~ normal(0, 100); 
+  logit_rec_mu_jm ~ normal(0, 100); 
+  logit_rec_sigma_af ~ cauchy(0, 5);
+  logit_rec_sigma_am ~ cauchy(0, 5);
+  logit_rec_sigma_jf ~ cauchy(0, 5);
+  logit_rec_sigma_jm ~ cauchy(0, 5);
+  for (t in 1:nyear) {
+    logit_rec_af[t] ~ normal(logit_rec_mu_af, logit_rec_sigma_af); 
+    logit_rec_am[t] ~ normal(logit_rec_mu_am, logit_rec_sigma_am); 
+    logit_rec_jf[t] ~ normal(logit_rec_mu_jf, logit_rec_sigma_jf); 
+    logit_rec_jm[t] ~ normal(logit_rec_mu_jm, logit_rec_sigma_jm); 
+  } // t
+
+  // bpop
+  log_bpop_sigma ~ cauchy(0, 5);
+  for (i in 1:narea) {
+    log_bpop[i,1] ~ normal(-1, 1); 
+    for (t in 2:nyear) {
+      log_bpop[i,t] ~ normal(log_bpop_mu[i,t-1], log_bpop_sigma);
+    } // t
+  } // i
+
+  ////// observation
+  // reproduction
+  for (i in 1:narea) {
+    for (t in 1:nyear) {
+      juv[i,t] ~ binomial(juv_adult[i,t], q[i,t]);
+    } // t
+  } // i
+
+  // survival
+  for (i in 1:narea) {
+    for (t in 1:nyear) {
+      marr_af[i,t] ~ multinomial(pr_af[i,t]);
+      marr_am[i,t] ~ multinomial(pr_am[i,t]);
+      marr_jf[i,t] ~ multinomial(pr_jf[i,t]);
+      marr_jm[i,t] ~ multinomial(pr_jm[i,t]);
+    } // t
+  } // i
+
+  // bpop
+  for (i in 1:narea) {
+    for (t in 1:nyear) {
+      bpop_obs[i,t] ~ normal(bpop[i,t], bpop_obs_se[i,t]);
+    } // t
+  } // i
+} // model
+
+", fill=TRUE)
+sink()
+
+#================
+# setup for Stan
+#================
+data <- list(narea=narea, nyear=nyear, 
+             bpop_obs=bpop_obs, bpop_obs_se=bpop_obs_se, 
+             juv=juv, juv_adult=juv_adult, 
+             marr_af=marr_af, marr_am=marr_am, 
+             marr_jf=marr_jf, marr_jm=marr_jm, 
+             pond=pond, fall=fall)
+
+init_fun <- function() {
+              list(
+                log_age_ratio_mu=rep(0, narea), 
+                log_age_ratio_bpop=rep(0, narea), 
+                log_age_ratio_pond=rep(0, narea), 
+                log_age_ratio_fall=rep(0, narea), 
+                log_age_ratio_sigma=1, 
+                log_age_ratio=matrix(0, narea, nyear), 
+                logit_sur_mu_af=rep(0, narea), 
+                logit_sur_mu_am=rep(0, narea), 
+                logit_sur_bpop_af=rep(0, narea), 
+                logit_sur_bpop_am=rep(0, narea), 
+                logit_sur_pond_af=rep(0, narea), 
+                logit_sur_pond_am=rep(0, narea), 
+                logit_sur_fall_af=rep(0, narea), 
+                logit_sur_fall_am=rep(0, narea), 
+                logit_sur_sigma_af=1, 
+                logit_sur_sigma_am=1, 
+                logit_sur_af=matrix(0, narea, nyear), 
+                logit_sur_am=matrix(0, narea, nyear), 
+                logit_rec_mu_af=logit(.02), 
+                logit_rec_mu_am=logit(.02), 
+                logit_rec_mu_jf=logit(.04), 
+                logit_rec_mu_jm=logit(.04), 
+                logit_rec_sigma_af=1, 
+                logit_rec_sigma_am=1, 
+                logit_rec_sigma_jf=1, 
+                logit_rec_sigma_jm=1, 
+                logit_rec_af=rep(logit(.02), nyear), 
+                logit_rec_am=rep(logit(.02), nyear), 
+                logit_rec_jf=rep(logit(.04), nyear), 
+                logit_rec_jm=rep(logit(.04), nyear), 
+                log_bpop_sigma=1, 
+                log_bpop=log(bpop_obs)
+              ) # list
+            } # function
+
+#===========
+# call STAN
+#===========
+rstan_options(auto_write=TRUE)
+options(mc.cores=parallel::detectCores())
+
+fit <- stan(file='c:/A. Pintail/ipm ddp cov.stan', 
+            data=data, init=init_fun, 
+            par=c('log_age_ratio_mu', 
+                  'log_age_ratio_bpop', 
+                  'log_age_ratio_pond', 
+                  'log_age_ratio_fall', 
+                  'log_age_ratio_sigma', 'age_ratio', 
+                  'logit_sur_mu_af', 'logit_sur_mu_am', 
+                  'logit_sur_bpop_af', 'logit_sur_bpop_am', 
+                  'logit_sur_pond_af', 'logit_sur_pond_am', 
+                  'logit_sur_fall_af', 'logit_sur_fall_am', 
+                  'logit_sur_sigma_af', 'logit_sur_sigma_am', 
+                  'sur_af', 'sur_am', 'sur_jf', 'sur_jm', 
+                  'logit_rec_mu_af', 'logit_rec_mu_am', 
+                  'logit_rec_mu_jf', 'logit_rec_mu_jm', 
+                  'logit_rec_sigma_af', 'logit_rec_sigma_am', 
+                  'logit_rec_sigma_jf', 'logit_rec_sigma_jm', 
+                  'rec_af', 'rec_am', 'rec_jf', 'rec_jm', 
+                  'log_bpop_sigma', 'bpop'), 
+            iter=2000, warmup=1000, thin=1, chains=3)
+
+#===============
+# check results
+#===============
+print(fit, digits=3, 
+      c('log_age_ratio_mu', 
+        'log_age_ratio_bpop', 
+        'log_age_ratio_pond', 
+        'log_age_ratio_fall', 
+        'log_age_ratio_sigma', 
+        'logit_sur_mu_af', 'logit_sur_mu_am', 
+        'logit_sur_bpop_af', 'logit_sur_bpop_am', 
+        'logit_sur_pond_af', 'logit_sur_pond_am', 
+        'logit_sur_fall_af', 'logit_sur_fall_am', 
+        'logit_sur_sigma_af', 'logit_sur_sigma_am', 
+        'logit_rec_mu_af', 'logit_rec_mu_am', 
+        'logit_rec_mu_jf', 'logit_rec_mu_jm', 
+        'logit_rec_sigma_af', 'logit_rec_sigma_am', 
+        'logit_rec_sigma_jf', 'logit_rec_sigma_jm', 
+        'log_bpop_sigma'))
+
+traceplot(fit, inc_warmup=T, 
+          c('log_age_ratio_mu', 
+            'log_age_ratio_bpop', 
+            'log_age_ratio_pond', 
+            'log_age_ratio_fall', 
+            'log_age_ratio_sigma', 
+            'logit_sur_mu_af', 'logit_sur_mu_am', 
+            'logit_sur_bpop_af', 'logit_sur_bpop_am', 
+            'logit_sur_pond_af', 'logit_sur_pond_am', 
+            'logit_sur_fall_af', 'logit_sur_fall_am', 
+            'logit_sur_sigma_af', 'logit_sur_sigma_am', 
+            'logit_rec_mu_af', 'logit_rec_mu_am', 
+            'logit_rec_mu_jf', 'logit_rec_mu_jm', 
+            'logit_rec_sigma_af', 'logit_rec_sigma_am', 
+            'logit_rec_sigma_jf', 'logit_rec_sigma_jm', 
+            'log_bpop_sigma'))
+
+#==============
+# save results
+#==============
+save(fit, file='c:/A. Pintail/ipm ddp cov.RData')
+
+
